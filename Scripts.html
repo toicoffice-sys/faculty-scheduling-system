@@ -1,0 +1,1500 @@
+<script>
+// ─── DLSL Faculty Timetabler — Client JS ──────────────────────────────────
+
+const LOGO_SRC = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAABKQAAASkCAMAAABq/SLiAAAACXBIWXMAACMQAAAjEAFnL93WAAADAFBMVE...'; // placeholder; actual logo embedded at deploy
+
+const DAYS = ['Monday','Tuesday','Wednesday','Thursday','Friday'];
+const DEPT_NAMES = {
+  SDA:   'School of Design & Arts',
+  SMIT:  'School of Management & Information Technology',
+  SHRIM: 'School of Hotel, Restaurant & Institutions Mgmt',
+  STHM:  'School of Tourism & Hospitality Management',
+  GEd:   'General Education Division',
+};
+const ROOM_TYPES = [
+  {v:'classroom',l:'Classroom',i:'🏫'},{v:'lab',l:'Lab/Computer Lab',i:'💻'},
+  {v:'gym',l:'Gymnasium',i:'🏋️'},{v:'hall',l:'Lecture Hall',i:'🎓'},
+  {v:'music',l:'Studio/Music',i:'🎬'},{v:'art',l:'Design Studio',i:'🎨'},
+  {v:'library',l:'Library',i:'📚'},{v:'workshop',l:'Workshop',i:'🪡'},
+];
+const CONSTRAINT_TYPES = [
+  {v:'spread_across_days',   l:'Spread across days (no 2 same day)'},
+  {v:'must_be_on_day',       l:'Must be on specific day'},
+  {v:'must_not_be_on_day',   l:'Must NOT be on specific day'},
+  {v:'room_required',        l:'Room type required'},
+  {v:'no_first_period',      l:'Not in first period of day'},
+  {v:'no_last_period',       l:'Not in last period of day'},
+  {v:'teacher_max_daily',    l:'Teacher max sessions per day'},
+];
+
+// ─── State ─────────────────────────────────────────────────────────────────
+
+const S = {
+  user: null,
+  faculty: [], buildings: [], rooms: [], subjects: [],
+  sections: [], periods: [], lessons: [], schedule: [], constraints: [],
+  config: {},
+  tab: 'schedule',
+  // Schedule
+  selectedLessonId: null,
+  filterFacId: '', filterSecId: '', filterSubjId: '',
+  // Faculty
+  selectedFacId: null,
+  facSearch: '', facDeptFilter: '',
+  // Rooms
+  selectedRoomId: null,
+  // Sections / Subjects
+  // Admin
+  adminUsers: [],
+  loading: false,
+};
+
+// ─── Helpers ───────────────────────────────────────────────────────────────
+
+function byId(arr, id) { return arr.find(x => x.id === id) || null; }
+function q(sel, root) { return (root || document).querySelector(sel); }
+function qa(sel, root) { return Array.from((root || document).querySelectorAll(sel)); }
+function esc(s) { return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+function facName(f) { return f ? f.lastName + ', ' + f.firstName : '—'; }
+function subjColor(subjId) { const s = byId(S.subjects, subjId); return s ? s.color : '#2E7D32'; }
+
+function teachingPeriodNames() {
+  const names = new Set();
+  S.periods.filter(p => !p.isBreak && !p.isLunch).forEach(p => names.add(p.name));
+  return Array.from(names).sort();
+}
+function periodByDayName(day, name) {
+  return S.periods.find(p => p.day === day && p.name === name) || null;
+}
+function periodStartTime(name) {
+  const p = S.periods.find(pp => pp.name === name);
+  return p ? p.startTime : '';
+}
+function entriesForPeriod(periodId) {
+  return S.schedule.filter(e => e.periodId === periodId);
+}
+function placedLessonIds() {
+  return new Set(S.schedule.map(e => e.lessonId));
+}
+function unplacedLessons() {
+  const placed = placedLessonIds();
+  let list = S.lessons.filter(l => !placed.has(l.id));
+  if (S.filterSubjId) list = list.filter(l => l.subjectId === S.filterSubjId);
+  if (S.filterFacId)  list = list.filter(l => l.teacherId === S.filterFacId);
+  if (S.filterSecId)  list = list.filter(l => l.sectionId === S.filterSecId);
+  return list;
+}
+function conflictCount() {
+  return S.schedule.filter(e => e._conflict).length;
+}
+function getCompletionPct() {
+  if (!S.lessons.length) return 0;
+  return Math.round((S.schedule.length / S.lessons.length) * 100);
+}
+function filteredFaculty() {
+  let list = [...S.faculty];
+  if (S.facDeptFilter) list = list.filter(f => f.department === S.facDeptFilter);
+  if (S.facSearch.trim()) {
+    const q2 = S.facSearch.trim().toLowerCase();
+    list = list.filter(f => (f.firstName + ' ' + f.lastName + ' ' + f.email).toLowerCase().includes(q2));
+  }
+  return list;
+}
+function canEdit()  { return S.user && (S.user.role === 'editor' || S.user.role === 'admin'); }
+function canAdmin() { return S.user && S.user.role === 'admin'; }
+
+// ─── Toast ─────────────────────────────────────────────────────────────────
+
+function toast(msg, type) {
+  const wrap = q('.toast-wrap') || (() => {
+    const el = document.createElement('div');
+    el.className = 'toast-wrap';
+    document.body.appendChild(el);
+    return el;
+  })();
+  const t = document.createElement('div');
+  t.className = 'toast' + (type === 'err' ? ' toast--err' : type === 'warn' ? ' toast--warn' : '');
+  t.textContent = msg;
+  wrap.appendChild(t);
+  setTimeout(() => t.remove(), 3500);
+}
+
+// ─── GAS API calls ─────────────────────────────────────────────────────────
+
+function call(fn, args, onSuccess, onError) {
+  let runner = google.script.run.withSuccessHandler(r => {
+    S.loading = false;
+    onSuccess && onSuccess(r);
+  }).withFailureHandler(e => {
+    S.loading = false;
+    const msg = e.message || 'Error occurred';
+    toast(msg, 'err');
+    onError && onError(e);
+    console.error(fn, e);
+  });
+  S.loading = true;
+  runner[fn].apply(runner, args || []);
+}
+
+// ─── Boot ──────────────────────────────────────────────────────────────────
+
+window.addEventListener('DOMContentLoaded', function () {
+  google.script.run
+    .withSuccessHandler(function(data) {
+      if (data.error === 'not_authorized') {
+        renderUnauthorized(false);
+      } else if (data.error === 'domain_restricted') {
+        renderUnauthorized(true, data.email);
+      } else {
+        Object.assign(S, data);
+        S.tab = 'schedule';
+        render();
+      }
+    })
+    .withFailureHandler(function(e) {
+      q('#app').innerHTML = '<div class="auth-page"><div class="auth-card"><p class="auth-err auth-msg">Failed to load: ' + esc(e.message) + '</p></div></div>';
+    })
+    .getBootData();
+});
+
+function renderUnauthorized(domainRestricted, email) {
+  const logoEl = '<img class="auth-logo" src="' + LOGO_SRC + '" alt="DLSL Logo" onerror="this.style.display=\'none\'">';
+  const msg = domainRestricted
+    ? '<p class="auth-msg auth-err">Access denied. Only <strong>@dlsl.edu.ph</strong> accounts are allowed.<br><small>Signed in as: ' + esc(email) + '</small></p>'
+    : '<p class="auth-msg">Your account has not been added to the system. Please contact your system administrator.</p>';
+  q('#app').innerHTML = '<div class="auth-page"><div class="auth-card">'
+    + logoEl
+    + '<h2 class="auth-title">DLSL Faculty Timetabler</h2>'
+    + '<p class="auth-sub">De La Salle Lipa · Scheduling System</p>'
+    + msg + '</div></div>';
+}
+
+// ─── Main Render ───────────────────────────────────────────────────────────
+
+function render() {
+  const app = q('#app');
+  app.innerHTML = renderLayout();
+  bindEvents();
+}
+
+function renderLayout() {
+  const TABS = [
+    { id: 'schedule',    label: 'Schedule',     badge: conflictCount() || 0 },
+    { id: 'faculty',     label: 'Faculty' },
+    { id: 'rooms',       label: 'Rooms' },
+    { id: 'subjects',    label: 'Subjects' },
+    { id: 'sections',    label: 'Sections' },
+    { id: 'constraints', label: 'Rules' },
+    { id: 'reports',     label: 'Reports' },
+    ...(canAdmin() ? [{ id: 'admin', label: 'Admin' }] : []),
+    { id: 'guide', label: '❓ Guide' },
+  ];
+  const cfg = S.config;
+  const pct = getCompletionPct();
+  const conflicts = conflictCount();
+
+  return '<div class="app">'
+    + '<header class="header">'
+    + '<div class="header__brand">'
+    + '<img class="header__logo" src="' + LOGO_SRC + '" alt="DLSL" onerror="this.style.display=\'none\'">'
+    + '<div class="header__title-wrap">'
+    + '<div class="header__title">Faculty Timetabler</div>'
+    + '<div class="header__sub">De La Salle Lipa</div>'
+    + '</div></div>'
+    + '<nav class="header__nav">' + TABS.map(t =>
+        '<button class="nav-btn' + (S.tab === t.id ? ' active' : '') + '" data-tab="' + t.id + '">'
+        + esc(t.label)
+        + (t.badge ? '<span class="nav-badge">' + t.badge + '</span>' : '')
+        + '</button>'
+      ).join('') + '</nav>'
+    + '<div class="header__right">'
+    + '<div class="term-chip">' + esc(cfg.term || '') + ' ' + esc(cfg.academicYear || '') + '</div>'
+    + '<div class="stat-pills">'
+    + statPill(pct + '%', 'Done')
+    + statPill(S.schedule.length, 'Placed')
+    + statPill(unplacedLessons().length, 'Pending')
+    + (conflicts ? statPill(conflicts, '⚠ Conflicts') : '')
+    + '</div>'
+    + '<div class="user-chip"><span class="role-badge role-badge--' + S.user.role + '">' + esc(S.user.role) + '</span>' + esc(S.user.name) + '</div>'
+    + '</div></header>'
+    + renderTabContent()
+    + '<div class="toast-wrap"></div>'
+    + '</div>';
+}
+
+function statPill(val, lbl) {
+  return '<div class="stat-pill"><span class="stat-pill__val">' + val + '</span><span class="stat-pill__lbl">' + esc(lbl) + '</span></div>';
+}
+
+function renderTabContent() {
+  switch (S.tab) {
+    case 'schedule':    return renderScheduleTab();
+    case 'faculty':     return renderFacultyTab();
+    case 'rooms':       return renderRoomsTab();
+    case 'subjects':    return renderSubjectsTab();
+    case 'sections':    return renderSectionsTab();
+    case 'constraints': return renderConstraintsTab();
+    case 'reports':     return renderReportsTab();
+    case 'admin':       return renderAdminTab();
+    case 'guide':       return renderGuideTab();
+    default:            return '';
+  }
+}
+
+// ─── Schedule Tab ──────────────────────────────────────────────────────────
+
+function renderScheduleTab() {
+  return '<div class="main"><div class="tab-content--nogap" style="flex-direction:column">'
+    + renderFilterBar()
+    + '<div class="schedule-layout">'
+    + renderUnscheduledPanel()
+    + renderGridArea()
+    + '</div></div></div>';
+}
+
+function renderFilterBar() {
+  return '<div class="filter-bar">'
+    + '<span class="filter-bar__label">Filter by:</span>'
+    + '<select class="form-select form-select--sm" id="filt-fac" style="min-width:140px">'
+    + '<option value="">All Faculty</option>'
+    + S.faculty.slice().sort((a,b)=>(a.lastName+a.firstName).localeCompare(b.lastName+b.firstName))
+               .map(f => '<option value="' + esc(f.id) + '"' + (S.filterFacId===f.id?' selected':'') + '>' + esc(facName(f)) + '</option>').join('')
+    + '</select>'
+    + '<select class="form-select form-select--sm" id="filt-sec" style="min-width:140px">'
+    + '<option value="">All Sections</option>'
+    + S.sections.map(s => '<option value="' + esc(s.id) + '"' + (S.filterSecId===s.id?' selected':'') + '>' + esc(s.name) + '</option>').join('')
+    + '</select>'
+    + '<select class="form-select form-select--sm" id="filt-subj" style="min-width:140px">'
+    + '<option value="">All Subjects</option>'
+    + S.subjects.map(s => '<option value="' + esc(s.id) + '"' + (S.filterSubjId===s.id?' selected':'') + '>' + esc(s.code) + '</option>').join('')
+    + '</select>'
+    + (S.filterFacId||S.filterSecId||S.filterSubjId ? '<button class="btn btn-ghost btn-sm" id="clear-filter">Clear</button>' : '')
+    + '<div style="margin-left:auto;display:flex;gap:8px">'
+    + (canEdit() ? '<button class="btn btn-primary btn-sm" id="btn-auto-sched">⚡ Auto Schedule</button>' : '')
+    + (canAdmin() ? '<button class="btn btn-danger btn-sm" id="btn-clear-sched">Clear All</button>' : '')
+    + '</div></div>';
+}
+
+function renderUnscheduledPanel() {
+  const unplaced = unplacedLessons();
+  return '<div class="unscheduled-panel">'
+    + '<div class="unscheduled-panel__head">'
+    + '<div class="unscheduled-panel__title">To Schedule <span class="text-muted">(' + unplaced.length + ')</span></div>'
+    + (S.selectedLessonId
+        ? '<div style="font-size:11px;color:var(--g800);font-weight:600;padding:4px 0">→ Click a grid cell to place</div>'
+        : '<div style="font-size:11px;color:var(--text-muted)">Click a lesson to select it</div>')
+    + '</div>'
+    + '<div class="unscheduled-panel__list">'
+    + (unplaced.length === 0
+        ? '<div class="unscheduled-panel__empty">All lessons scheduled! ✓</div>'
+        : unplaced.map(l => renderLessonItem(l)).join(''))
+    + '</div></div>';
+}
+
+function renderLessonItem(l) {
+  const subj  = byId(S.subjects, l.subjectId);
+  const fac   = byId(S.faculty,  l.teacherId);
+  const sec   = byId(S.sections, l.sectionId);
+  const color = subj ? subj.color : '#2E7D32';
+  const sel   = S.selectedLessonId === l.id;
+  return '<div class="lesson-item' + (sel ? ' selected' : '') + '" data-lesson-id="' + esc(l.id) + '">'
+    + '<div class="lesson-item__subj"><span class="lesson-item__dot" style="background:' + color + '"></span>'
+    + esc(subj ? subj.code : '?') + '</div>'
+    + '<div class="lesson-item__teacher">' + esc(fac ? facName(fac) : 'No faculty') + '</div>'
+    + '<div class="lesson-item__meta">'
+    + '<span class="lesson-item__chip lesson-item__chip--section">' + esc(sec ? sec.name : '—') + '</span>'
+    + '<span class="lesson-item__chip lesson-item__chip--periods">' + l.periodsRequired + '×/wk</span>'
+    + '</div></div>';
+}
+
+function renderGridArea() {
+  const pNames = teachingPeriodNames();
+  const hasLunch = S.periods.some(p => p.isLunch);
+
+  let grid = '<div class="schedule-grid-area"><div class="schedule-grid">';
+  grid += '<div class="grid-corner"></div>';
+  DAYS.forEach(d => { grid += '<div class="grid-day-hdr">' + d.slice(0,3) + '</div>'; });
+
+  // Lunch row first marker
+  let lunchInserted = false;
+
+  pNames.forEach(pName => {
+    // Insert lunch row if periods come after lunch and we haven't inserted yet
+    if (hasLunch && !lunchInserted) {
+      const firstLunchPeriod = S.periods.find(p => p.isLunch);
+      const firstTeachingAfterLunch = S.periods.find(p => !p.isLunch && !p.isBreak && p.name === pName && p.startTime > (firstLunchPeriod ? firstLunchPeriod.startTime : ''));
+      if (firstTeachingAfterLunch && firstLunchPeriod && firstLunchPeriod.startTime < firstTeachingAfterLunch.startTime) {
+        grid += renderLunchRow(firstLunchPeriod);
+        lunchInserted = true;
+      }
+    }
+
+    const startTime = periodStartTime(pName);
+    grid += '<div class="grid-period-lbl"><span>' + esc(pName) + '</span><span class="time">' + esc(startTime) + '</span></div>';
+    DAYS.forEach(day => { grid += renderGridCell(day, pName); });
+  });
+
+  // Lunch if never inserted
+  if (hasLunch && !lunchInserted) {
+    const lp = S.periods.find(p => p.isLunch);
+    if (lp) grid += renderLunchRow(lp);
+  }
+
+  grid += '</div></div>';
+  return grid;
+}
+
+function renderLunchRow(lunchPeriod) {
+  let html = '<div class="grid-period-lbl"><span>Lunch</span><span class="time">' + esc(lunchPeriod.startTime) + '</span></div>';
+  DAYS.forEach(() => { html += '<div class="grid-cell grid-cell--lunch"><div class="grid-cell--lunch-lbl">Lunch Break</div></div>'; });
+  return html;
+}
+
+function renderGridCell(day, pName) {
+  const period = periodByDayName(day, pName);
+  if (!period) return '<div class="grid-cell" style="background:var(--g50)"></div>';
+
+  const entries = entriesForPeriod(period.id);
+  const filtered = applyEntryFilter(entries);
+  const canDrop  = canEdit() && S.selectedLessonId && filtered.length === 0;
+
+  let html = '<div class="grid-cell' + (canDrop ? ' droppable' : '') + '"'
+    + ' data-place-period="' + esc(period.id) + '">';
+  filtered.forEach(e => { html += renderEntryCard(e); });
+  html += '</div>';
+  return html;
+}
+
+function applyEntryFilter(entries) {
+  return entries.filter(e => {
+    const l = byId(S.lessons, e.lessonId);
+    if (!l) return false;
+    if (S.filterFacId  && l.teacherId !== S.filterFacId)  return false;
+    if (S.filterSecId  && l.sectionId !== S.filterSecId)  return false;
+    if (S.filterSubjId && l.subjectId !== S.filterSubjId) return false;
+    return true;
+  });
+}
+
+function renderEntryCard(entry) {
+  const lesson = byId(S.lessons, entry.lessonId);
+  if (!lesson) return '';
+  const subj  = byId(S.subjects, lesson.subjectId);
+  const fac   = byId(S.faculty,  lesson.teacherId);
+  const sec   = byId(S.sections, lesson.sectionId);
+  const room  = byId(S.rooms,    entry.roomId);
+  const color = subj ? subj.color : '#2E7D32';
+  const locked = entry.status === 'locked';
+  const conflict = entry._conflict;
+
+  return '<div class="entry-card' + (locked ? ' locked' : '') + (conflict ? ' conflict' : '') + '"'
+    + ' style="border-left-color:' + color + '"'
+    + ' data-entry-id="' + esc(entry.id) + '">'
+    + (locked ? '<span class="entry-card__lock-icon">🔒</span>' : '')
+    + '<div class="entry-card__subj">' + esc(subj ? subj.code : '?') + '</div>'
+    + '<div class="entry-card__teacher">' + esc(fac ? fac.lastName : '—') + '</div>'
+    + '<div class="entry-card__meta">'
+    + (sec  ? '<span class="entry-card__section">' + esc(sec.name) + '</span>' : '')
+    + (room ? '<span class="entry-card__room">' + esc(room.code || room.name) + '</span>' : '')
+    + '</div>'
+    + (conflict ? '<div class="entry-card__conflict">⚠ Conflict</div>' : '')
+    + '<div class="entry-card__actions">'
+    + (canEdit() ? '<button class="entry-card__btn entry-card__btn--lock" data-entry-lock="' + esc(entry.id) + '">' + (locked ? '🔓' : '🔒') + '</button>' : '')
+    + (canEdit() && !locked ? '<button class="entry-card__btn entry-card__btn--remove" data-entry-remove="' + esc(entry.id) + '">✕</button>' : '')
+    + '</div></div>';
+}
+
+// ─── Faculty Tab ───────────────────────────────────────────────────────────
+
+function renderFacultyTab() {
+  const filtered = filteredFaculty();
+  const depts = [...new Set(S.faculty.map(f => f.department))].sort();
+  const selFac = S.selectedFacId ? byId(S.faculty, S.selectedFacId) : null;
+
+  return '<div class="main"><div class="tab-content--nogap two-col">'
+    + '<div class="sidebar">'
+    + '<div class="sidebar__head">'
+    + '<div class="sidebar__head-row">'
+    + '<div class="sidebar__title">Faculty <span class="text-muted text-sm">(' + filtered.length + '/' + S.faculty.length + ')</span></div>'
+    + (canEdit() ? '<button class="btn btn-primary btn-sm" id="btn-add-fac">+ Add</button>' : '')
+    + '</div>'
+    + '<input class="form-input form-input--sm w-full mb-1" id="fac-search" placeholder="Search name or email…" value="' + esc(S.facSearch) + '">'
+    + '<select class="form-select form-select--sm w-full" id="fac-dept-filter">'
+    + '<option value="">All Departments</option>'
+    + depts.map(d => '<option value="' + esc(d) + '"' + (S.facDeptFilter===d?' selected':'') + '>' + esc(d) + ' — ' + esc(DEPT_NAMES[d]||d) + '</option>').join('')
+    + '</select>'
+    + '</div>'
+    + '<div class="sidebar__list">'
+    + filtered.map(f => renderFacListItem(f)).join('')
+    + '</div></div>'
+    + '<div class="detail-pane">'
+    + (selFac ? renderFacDetail(selFac) : renderFacFormOrPlaceholder())
+    + '</div></div></div>';
+}
+
+function renderFacListItem(f) {
+  const active = S.selectedFacId === f.id;
+  const wk = S.schedule.filter(e => { const l = byId(S.lessons,e.lessonId); return l && l.teacherId === f.id; }).length;
+  return '<div class="list-item' + (active ? ' active' : '') + '" data-fac-id="' + esc(f.id) + '">'
+    + '<div class="list-item__name">' + esc(f.lastName) + ', ' + esc(f.firstName) + '</div>'
+    + '<div class="list-item__sub">' + esc(f.department) + (f.track ? ' · ' + f.track : '') + '</div>'
+    + '<div class="list-item__tags">'
+    + '<span class="type-badge type-badge--' + f.role + '">' + esc(f.role) + '</span>'
+    + '<span class="text-xs text-muted">' + wk + ' sessions</span>'
+    + '</div></div>';
+}
+
+function renderFacFormOrPlaceholder() {
+  if (S._showAddFacForm) return renderFacAddForm();
+  return '<div class="detail-pane__placeholder">Select a faculty member to view availability</div>';
+}
+
+function renderFacDetail(f) {
+  const teachingPeriods = S.periods.filter(p => !p.isBreak && !p.isLunch);
+  const pNames = [...new Set(teachingPeriods.map(p => p.name))].sort();
+  const wk = S.schedule.filter(e => { const l = byId(S.lessons,e.lessonId); return l && l.teacherId === f.id; }).length;
+
+  function isAvail(day, pid) {
+    const a = (f.availability || []).find(x => x.day === day);
+    return a && a.periodIds && a.periodIds.includes(pid);
+  }
+
+  let html = '<div style="max-width:680px">'
+    + '<div style="display:flex;align-items:center;gap:12px;margin-bottom:20px">'
+    + '<div><div style="font-size:20px;font-weight:800;color:var(--g900)">' + esc(f.firstName) + ' ' + esc(f.lastName) + '</div>'
+    + '<div style="font-size:13px;color:var(--text-muted)">' + esc(f.email) + '</div></div>'
+    + '<div style="margin-left:auto;display:flex;gap:8px;align-items:center">'
+    + '<span class="type-badge type-badge--' + f.role + '">' + esc(f.role) + '</span>'
+    + (canEdit() ? '<button class="btn btn-danger btn-sm" data-del-fac="' + esc(f.id) + '">Delete</button>' : '')
+    + '</div></div>'
+    + '<div style="display:flex;gap:24px;margin-bottom:20px;font-size:13px">'
+    + '<span><span class="text-muted">Dept:</span> <strong>' + esc(f.department) + '</strong></span>'
+    + (f.track ? '<span><span class="text-muted">Track:</span> <strong>' + esc(f.track) + '</strong></span>' : '')
+    + '<span><span class="text-muted">Max:</span> <strong>' + f.maxPerDay + '/day · ' + f.maxPerWeek + '/week</strong></span>'
+    + '<span><span class="text-muted">Scheduled:</span> <strong>' + wk + ' sessions</strong></span>'
+    + '</div>';
+
+  // Edit form (inline for availability editing)
+  html += '<div style="margin-bottom:16px;padding:14px;background:var(--g50);border-radius:var(--radius);border:1px solid var(--border)">'
+    + '<div style="font-size:12px;font-weight:700;color:var(--text-muted);margin-bottom:10px;text-transform:uppercase">Edit Info</div>'
+    + '<div class="form-row mb-1">'
+    + '<div class="form-group"><label class="form-label">First Name</label><input class="form-input form-input--sm" id="fac-edit-fn" value="' + esc(f.firstName) + '"></div>'
+    + '<div class="form-group"><label class="form-label">Last Name</label><input class="form-input form-input--sm" id="fac-edit-ln" value="' + esc(f.lastName) + '"></div>'
+    + '<div class="form-group"><label class="form-label">Email</label><input class="form-input form-input--sm" id="fac-edit-email" value="' + esc(f.email) + '"></div>'
+    + '</div>'
+    + '<div class="form-row">'
+    + '<div class="form-group"><label class="form-label">Department</label>'
+    + '<select class="form-select form-select--sm" id="fac-edit-dept">'
+    + ['SDA','SMIT','SHRIM','STHM','GEd'].map(d => '<option value="' + d + '"' + (f.department===d?' selected':'') + '>' + d + '</option>').join('')
+    + '</select></div>'
+    + '<div class="form-group"><label class="form-label">Track</label><input class="form-input form-input--sm" id="fac-edit-track" value="' + esc(f.track||'') + '"></div>'
+    + '<div class="form-group"><label class="form-label">Role</label>'
+    + '<select class="form-select form-select--sm" id="fac-edit-role">'
+    + ['full-time','part-time','shared','adviser'].map(r => '<option value="' + r + '"' + (f.role===r?' selected':'') + '>' + r + '</option>').join('')
+    + '</select></div>'
+    + '<div class="form-group"><label class="form-label">Max/day</label><input type="number" min="1" max="8" class="form-input form-input--sm" id="fac-edit-mpd" value="' + (f.maxPerDay||5) + '" style="width:60px"></div>'
+    + '<div class="form-group"><label class="form-label">Max/week</label><input type="number" min="1" max="35" class="form-input form-input--sm" id="fac-edit-mpw" value="' + (f.maxPerWeek||22) + '" style="width:60px"></div>'
+    + '</div>'
+    + (canEdit() ? '<button class="btn btn-primary btn-sm mt-1" id="btn-save-fac" data-fac-id="' + esc(f.id) + '">Save Changes</button>' : '')
+    + '</div>';
+
+  // Availability grid
+  html += '<div style="font-size:12px;font-weight:700;color:var(--text-muted);margin-bottom:10px;text-transform:uppercase">Availability</div>';
+  html += '<table class="avail-table"><thead><tr><th>Period</th>'
+    + DAYS.map(d => '<th>' + d.slice(0,3) + '</th>').join('') + '</tr></thead><tbody>';
+  pNames.forEach(pName => {
+    html += '<tr><td style="font-size:11px;font-weight:700;color:var(--text-muted);padding-right:8px">' + esc(pName) + '</td>';
+    DAYS.forEach(day => {
+      const period = periodByDayName(day, pName);
+      if (!period) { html += '<td>—</td>'; return; }
+      const on = isAvail(day, period.id);
+      const editable = canEdit() ? '' : ' readonly';
+      html += '<td><div class="avail-cell ' + (on ? 'on' : '') + editable + '" data-avail-fac="' + esc(f.id) + '" data-avail-period="' + esc(period.id) + '" data-avail-day="' + esc(day) + '">' + (on ? '✓' : '') + '</div></td>';
+    });
+    html += '</tr>';
+  });
+  html += '</tbody></table></div>';
+  return html;
+}
+
+function renderFacAddForm() {
+  const depts = ['SDA','SMIT','SHRIM','STHM','GEd'];
+  return '<div style="max-width:560px"><div class="page-header"><h2 class="page-title">Add Faculty</h2><button class="btn btn-ghost btn-sm" id="btn-cancel-add-fac">Cancel</button></div>'
+    + '<div class="inline-form">'
+    + '<div class="form-row mb-1">'
+    + '<div class="form-group"><label class="form-label">First Name *</label><input class="form-input" id="nf-fn" placeholder="First name"></div>'
+    + '<div class="form-group"><label class="form-label">Last Name *</label><input class="form-input" id="nf-ln" placeholder="Last name"></div>'
+    + '</div>'
+    + '<div class="form-group mb-1"><label class="form-label">Email</label><input class="form-input" id="nf-email" type="email" placeholder="name@dlsl.edu.ph"></div>'
+    + '<div class="form-row mb-1">'
+    + '<div class="form-group"><label class="form-label">Department</label><select class="form-select" id="nf-dept">'
+    + depts.map(d => '<option value="' + d + '">' + d + '</option>').join('')
+    + '</select></div>'
+    + '<div class="form-group"><label class="form-label">Track</label><input class="form-input" id="nf-track" placeholder="Specialization"></div>'
+    + '</div>'
+    + '<div class="form-row mb-1">'
+    + '<div class="form-group"><label class="form-label">Role</label><select class="form-select" id="nf-role">'
+    + ['full-time','part-time','shared','adviser'].map(r => '<option value="' + r + '">' + r + '</option>').join('')
+    + '</select></div>'
+    + '<div class="form-group"><label class="form-label">Max/day</label><input type="number" min="1" max="8" class="form-input" id="nf-mpd" value="5"></div>'
+    + '<div class="form-group"><label class="form-label">Max/week</label><input type="number" min="1" max="35" class="form-input" id="nf-mpw" value="22"></div>'
+    + '</div>'
+    + '<div style="font-size:12px;color:var(--text-muted);margin-bottom:8px">Availability: Set after creating via the faculty list.</div>'
+    + '<button class="btn btn-primary" id="btn-submit-add-fac">Add Faculty Member</button>'
+    + '</div></div>';
+}
+
+// ─── Rooms Tab ─────────────────────────────────────────────────────────────
+
+function renderRoomsTab() {
+  const selRoom = S.selectedRoomId ? byId(S.rooms, S.selectedRoomId) : null;
+
+  return '<div class="main"><div class="tab-content--nogap two-col">'
+    + '<div class="sidebar">'
+    + '<div class="sidebar__head">'
+    + '<div class="sidebar__head-row">'
+    + '<div class="sidebar__title">Rooms <span class="text-muted text-sm">(' + S.rooms.length + ')</span></div>'
+    + (canEdit() ? '<button class="btn btn-primary btn-sm" id="btn-add-room">+ Room</button>' : '')
+    + '</div></div>'
+    + '<div class="sidebar__list">'
+    + renderBuildingTree()
+    + '</div></div>'
+    + '<div class="detail-pane">'
+    + (S._showAddRoomForm ? renderRoomForm(null) : (selRoom ? renderRoomDetail(selRoom) : '<div class="detail-pane__placeholder">Select a room to view details</div>'))
+    + '</div></div></div>';
+}
+
+function renderBuildingTree() {
+  let html = '';
+  const unassigned = S.rooms.filter(r => !r.buildingId || !byId(S.buildings, r.buildingId));
+
+  S.buildings.forEach(b => {
+    const bRooms = S.rooms.filter(r => r.buildingId === b.id);
+    html += '<div class="building-group">'
+      + '<div class="building-name"><span class="dot"></span>🏢 ' + esc(b.name) + ' <span class="text-muted text-xs">(' + bRooms.length + ')</span>'
+      + (canAdmin() ? '<button class="btn-icon btn-xs" data-del-building="' + esc(b.id) + '" title="Delete building" style="margin-left:auto">✕</button>' : '')
+      + '</div>'
+      + bRooms.map(r => renderRoomListItem(r)).join('')
+      + '</div>';
+  });
+
+  if (unassigned.length) {
+    html += '<div class="building-group">'
+      + '<div class="building-name"><span class="dot"></span>Unassigned</div>'
+      + unassigned.map(r => renderRoomListItem(r)).join('')
+      + '</div>';
+  }
+
+  if (S.buildings.length === 0 && S.rooms.length === 0) {
+    html += '<div style="padding:20px;text-align:center;color:var(--text-muted);font-size:13px">No rooms yet. Add a building and rooms.</div>';
+  }
+
+  return html;
+}
+
+function renderRoomListItem(r) {
+  const bldg  = byId(S.buildings, r.buildingId);
+  const typeInfo = ROOM_TYPES.find(t => t.v === r.type) || { i: '🚪', l: r.type };
+  const active = S.selectedRoomId === r.id;
+  const bookings = S.schedule.filter(e => e.roomId === r.id).length;
+
+  return '<button class="room-card' + (active ? ' active' : '') + '" data-room-id="' + esc(r.id) + '">'
+    + '<span class="room-card__icon">' + typeInfo.i + '</span>'
+    + '<div style="flex:1;min-width:0"><div class="room-card__name">' + esc(r.name) + '</div>'
+    + '<div class="room-card__code">' + esc(r.code) + ' · ' + esc(typeInfo.l) + ' · 👥 ' + r.capacity
+    + (bookings ? ' · <span style="color:var(--g800)">' + bookings + ' sessions</span>' : '') + '</div></div></button>';
+}
+
+function renderRoomDetail(r) {
+  const bldg = byId(S.buildings, r.buildingId);
+  const typeInfo = ROOM_TYPES.find(t => t.v === r.type) || { i: '🚪', l: r.type };
+  const bookings = S.schedule.filter(e => e.roomId === r.id);
+
+  return '<div style="max-width:560px">'
+    + '<div style="display:flex;align-items:center;gap:10px;margin-bottom:20px">'
+    + '<span style="font-size:28px">' + typeInfo.i + '</span>'
+    + '<div><div style="font-size:18px;font-weight:800;color:var(--g900)">' + esc(r.name) + '</div>'
+    + '<div class="text-muted text-sm">' + esc(r.code) + ' · ' + esc(bldg ? bldg.name : 'Unassigned') + '</div></div>'
+    + (canEdit() ? '<button class="btn btn-danger btn-sm" style="margin-left:auto" data-del-room="' + esc(r.id) + '">Delete</button>' : '')
+    + '</div>'
+    + renderRoomForm(r)
+    + '<div style="margin-top:20px"><div class="section-title">Sessions in this room (' + bookings.length + ')</div>'
+    + (bookings.length === 0 ? '<p class="text-muted text-sm">No sessions scheduled yet.</p>'
+        : '<div class="table-wrap"><table class="data-table"><thead><tr><th>Day</th><th>Period</th><th>Subject</th><th>Faculty</th><th>Section</th></tr></thead><tbody>'
+        + bookings.map(e => {
+            const les = byId(S.lessons, e.lessonId);
+            const per = byId(S.periods, e.periodId);
+            const fac = les ? byId(S.faculty, les.teacherId) : null;
+            const sub = les ? byId(S.subjects, les.subjectId) : null;
+            const sec = les ? byId(S.sections, les.sectionId) : null;
+            return '<tr><td>' + esc(per ? per.day : '—') + '</td><td>' + esc(per ? per.name : '—') + '</td>'
+              + '<td>' + esc(sub ? sub.code : '—') + '</td><td>' + esc(fac ? facName(fac) : '—') + '</td>'
+              + '<td>' + esc(sec ? sec.name : '—') + '</td></tr>';
+          }).join('')
+        + '</tbody></table></div>')
+    + '</div></div>';
+}
+
+function renderRoomForm(r) {
+  const isNew = !r;
+  return '<div class="inline-form">'
+    + '<div class="inline-form-title">' + (isNew ? 'New Room' : 'Edit Room') + '</div>'
+    + '<div class="form-row mb-1">'
+    + '<div class="form-group" style="flex:2"><label class="form-label">Room Name *</label><input class="form-input" id="rf-name" value="' + esc(r ? r.name : '') + '" placeholder="e.g. Computer Lab A"></div>'
+    + '<div class="form-group" style="flex:1"><label class="form-label">Code</label><input class="form-input" id="rf-code" value="' + esc(r ? r.code : '') + '" placeholder="e.g. CLA"></div>'
+    + '</div>'
+    + '<div class="form-row mb-1">'
+    + '<div class="form-group"><label class="form-label">Capacity</label><input type="number" min="1" class="form-input" id="rf-cap" value="' + (r ? r.capacity : 35) + '" style="width:70px"></div>'
+    + '<div class="form-group"><label class="form-label">Type</label><select class="form-select" id="rf-type">'
+    + ROOM_TYPES.map(t => '<option value="' + t.v + '"' + (r && r.type===t.v ? ' selected' : '') + '>' + t.i + ' ' + t.l + '</option>').join('')
+    + '</select></div>'
+    + '<div class="form-group"><label class="form-label">Building</label><select class="form-select" id="rf-bldg">'
+    + '<option value="">— None —</option>'
+    + S.buildings.map(b => '<option value="' + esc(b.id) + '"' + (r && r.buildingId===b.id ? ' selected' : '') + '>' + esc(b.name) + '</option>').join('')
+    + '</select></div>'
+    + '</div>'
+    + (canEdit() ? '<div style="display:flex;gap:8px">'
+        + '<button class="btn btn-primary" id="btn-save-room" data-room-id="' + esc(r ? r.id : '') + '">Save Room</button>'
+        + '<button class="btn btn-ghost" id="btn-cancel-room">Cancel</button>'
+        + '</div>' : '')
+    + '<div style="margin-top:12px"><label class="form-label mb-1">Building Management</label>'
+    + (canEdit() ? '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
+        + '<input class="form-input form-input--sm" id="new-bldg-name" placeholder="New building name" style="width:160px">'
+        + '<input class="form-input form-input--sm" id="new-bldg-addr" placeholder="Address" style="width:180px">'
+        + '<button class="btn btn-secondary btn-sm" id="btn-add-building">+ Add Building</button>'
+        + '</div>' : '<span class="text-muted text-sm">Admin only</span>')
+    + '</div></div>';
+}
+
+// ─── Subjects Tab ──────────────────────────────────────────────────────────
+
+function renderSubjectsTab() {
+  return '<div class="main"><div class="tab-content">'
+    + '<div class="page-header"><h2 class="page-title">Subjects / Programs</h2>'
+    + (canEdit() ? '<button class="btn btn-primary" id="btn-toggle-add-subj">+ Add Subject</button>' : '')
+    + '</div>'
+    + (S._showAddSubjForm ? renderSubjectAddForm() : '')
+    + '<div class="table-wrap"><table class="data-table"><thead><tr>'
+    + '<th>Color</th><th>Code</th><th>Name</th><th>Department</th><th>Requires Room Type</th>'
+    + (canEdit() ? '<th>Actions</th>' : '')
+    + '</tr></thead><tbody>'
+    + S.subjects.map(s => '<tr>'
+        + '<td><span class="subject-dot" style="background:' + s.color + '"></span></td>'
+        + '<td><strong>' + esc(s.code) + '</strong></td>'
+        + '<td>' + esc(s.name) + '</td>'
+        + '<td><span class="dept-badge">' + esc(s.department) + '</span></td>'
+        + '<td>' + esc(s.requiresRoom || '—') + '</td>'
+        + (canEdit() ? '<td><button class="btn btn-danger btn-xs" data-del-subj="' + esc(s.id) + '">Delete</button></td>' : '')
+        + '</tr>').join('')
+    + '</tbody></table></div>'
+    + '</div></div>';
+}
+
+function renderSubjectAddForm() {
+  return '<div class="inline-form mb-2">'
+    + '<div class="inline-form-title">Add Subject</div>'
+    + '<div class="form-row mb-1">'
+    + '<div class="form-group"><label class="form-label">Code *</label><input class="form-input" id="sj-code" placeholder="e.g. CIS101"></div>'
+    + '<div class="form-group" style="flex:2"><label class="form-label">Name *</label><input class="form-input" id="sj-name" placeholder="Subject name"></div>'
+    + '</div>'
+    + '<div class="form-row mb-1">'
+    + '<div class="form-group"><label class="form-label">Department</label><select class="form-select" id="sj-dept">'
+    + ['SDA','SMIT','SHRIM','STHM','GEd'].map(d=>'<option value="'+d+'">'+d+'</option>').join('')
+    + '</select></div>'
+    + '<div class="form-group"><label class="form-label">Requires Room</label><select class="form-select" id="sj-req-room">'
+    + '<option value="">None</option>'
+    + ROOM_TYPES.map(t=>'<option value="'+t.v+'">'+t.i+' '+t.l+'</option>').join('')
+    + '</select></div>'
+    + '<div class="form-group"><label class="form-label">Color</label><input type="color" class="form-input" id="sj-color" value="#2E7D32" style="width:60px;padding:2px"></div>'
+    + '</div>'
+    + '<div style="display:flex;gap:8px">'
+    + '<button class="btn btn-primary" id="btn-save-subj">Add Subject</button>'
+    + '<button class="btn btn-ghost" id="btn-cancel-subj">Cancel</button>'
+    + '</div></div>';
+}
+
+// ─── Sections Tab ──────────────────────────────────────────────────────────
+
+function renderSectionsTab() {
+  return '<div class="main"><div class="tab-content">'
+    + '<div class="page-header"><h2 class="page-title">Sections / Classes</h2>'
+    + (canEdit() ? '<button class="btn btn-primary" id="btn-toggle-add-sec">+ Add Section</button>' : '')
+    + '</div>'
+    + (S._showAddSecForm ? renderSectionAddForm() : '')
+    + '<div class="table-wrap"><table class="data-table"><thead><tr>'
+    + '<th>Name</th><th>Year</th><th>Size</th><th>Program</th><th>Lessons</th>'
+    + (canEdit() ? '<th>Actions</th>' : '')
+    + '</tr></thead><tbody>'
+    + S.sections.map(s => {
+        const lesCount = S.lessons.filter(l => l.sectionId === s.id).length;
+        const placed   = S.schedule.filter(e => { const l=byId(S.lessons,e.lessonId); return l&&l.sectionId===s.id; }).length;
+        return '<tr>'
+          + '<td><strong>' + esc(s.name) + '</strong></td>'
+          + '<td>Year ' + s.year + '</td>'
+          + '<td>' + s.size + '</td>'
+          + '<td>' + esc(s.program || '—') + '</td>'
+          + '<td>' + placed + '/' + lesCount + ' scheduled</td>'
+          + (canEdit() ? '<td><button class="btn btn-danger btn-xs" data-del-sec="' + esc(s.id) + '">Delete</button></td>' : '')
+          + '</tr>';
+      }).join('')
+    + '</tbody></table></div></div></div>';
+}
+
+function renderSectionAddForm() {
+  return '<div class="inline-form mb-2">'
+    + '<div class="inline-form-title">Add Section</div>'
+    + '<div class="form-row mb-1">'
+    + '<div class="form-group" style="flex:2"><label class="form-label">Section Name *</label><input class="form-input" id="sc-name" placeholder="e.g. BSCS-1A"></div>'
+    + '<div class="form-group"><label class="form-label">Year</label><input type="number" min="1" max="5" class="form-input" id="sc-year" value="1"></div>'
+    + '<div class="form-group"><label class="form-label">Size</label><input type="number" min="1" class="form-input" id="sc-size" value="35"></div>'
+    + '</div>'
+    + '<div class="form-group mb-1"><label class="form-label">Program</label><input class="form-input" id="sc-prog" placeholder="e.g. BS Computer Science"></div>'
+    + '<div style="display:flex;gap:8px">'
+    + '<button class="btn btn-primary" id="btn-save-sec">Add Section</button>'
+    + '<button class="btn btn-ghost" id="btn-cancel-sec">Cancel</button>'
+    + '</div></div>';
+}
+
+// ─── Constraints Tab ────────────────────────────────────────────────────────
+
+function renderConstraintsTab() {
+  return '<div class="main"><div class="tab-content">'
+    + '<div class="page-header"><h2 class="page-title">Scheduling Rules</h2>'
+    + (canEdit() ? '<button class="btn btn-primary" id="btn-toggle-add-con">+ Add Rule</button>' : '')
+    + '</div>'
+    + (S._showAddConForm ? renderConstraintAddForm() : '')
+    + '<div class="table-wrap"><table class="data-table"><thead><tr>'
+    + '<th>Type</th><th>Severity</th><th>Description</th><th>Faculty</th><th>Section</th><th>Subject</th><th>Value</th>'
+    + (canEdit() ? '<th></th>' : '')
+    + '</tr></thead><tbody>'
+    + (S.constraints.length === 0 ? '<tr><td colspan="8" style="text-align:center;padding:24px;color:var(--text-muted)">No rules defined yet</td></tr>' : '')
+    + S.constraints.map(c => {
+        const fac = c.teacherId ? byId(S.faculty, c.teacherId) : null;
+        const sec = c.sectionId ? byId(S.sections, c.sectionId) : null;
+        const sub = c.subjectId ? byId(S.subjects, c.subjectId) : null;
+        return '<tr>'
+          + '<td><span class="text-sm" style="font-family:monospace">' + esc(c.type) + '</span></td>'
+          + '<td><span class="severity-badge severity-badge--' + c.severity + '">' + c.severity + '</span></td>'
+          + '<td>' + esc(c.description) + '</td>'
+          + '<td>' + esc(fac ? facName(fac) : '—') + '</td>'
+          + '<td>' + esc(sec ? sec.name : '—') + '</td>'
+          + '<td>' + esc(sub ? sub.code : '—') + '</td>'
+          + '<td>' + esc(c.value || '—') + '</td>'
+          + (canEdit() ? '<td><button class="btn btn-danger btn-xs" data-del-con="' + esc(c.id) + '">✕</button></td>' : '')
+          + '</tr>';
+      }).join('')
+    + '</tbody></table></div></div></div>';
+}
+
+function renderConstraintAddForm() {
+  return '<div class="inline-form mb-2">'
+    + '<div class="inline-form-title">Add Rule</div>'
+    + '<div class="form-row mb-1">'
+    + '<div class="form-group"><label class="form-label">Type</label><select class="form-select" id="con-type">'
+    + CONSTRAINT_TYPES.map(t=>'<option value="'+t.v+'">'+t.l+'</option>').join('')
+    + '</select></div>'
+    + '<div class="form-group"><label class="form-label">Severity</label><select class="form-select" id="con-sev">'
+    + '<option value="hard">Hard (must not violate)</option><option value="soft">Soft (prefer not to)</option>'
+    + '</select></div>'
+    + '</div>'
+    + '<div class="form-group mb-1"><label class="form-label">Description</label><input class="form-input" id="con-desc" placeholder="Brief description"></div>'
+    + '<div class="form-row mb-1">'
+    + '<div class="form-group"><label class="form-label">Faculty (optional)</label><select class="form-select" id="con-fac">'
+    + '<option value="">— All —</option>'
+    + S.faculty.map(f=>'<option value="'+esc(f.id)+'">'+esc(facName(f))+'</option>').join('')
+    + '</select></div>'
+    + '<div class="form-group"><label class="form-label">Section (optional)</label><select class="form-select" id="con-sec">'
+    + '<option value="">— All —</option>'
+    + S.sections.map(s=>'<option value="'+esc(s.id)+'">'+esc(s.name)+'</option>').join('')
+    + '</select></div>'
+    + '<div class="form-group"><label class="form-label">Subject (optional)</label><select class="form-select" id="con-subj">'
+    + '<option value="">— All —</option>'
+    + S.subjects.map(s=>'<option value="'+esc(s.id)+'">'+esc(s.code)+'</option>').join('')
+    + '</select></div>'
+    + '<div class="form-group"><label class="form-label">Value</label><input class="form-input" id="con-val" placeholder="e.g. Monday, lab"></div>'
+    + '</div>'
+    + '<div style="display:flex;gap:8px">'
+    + '<button class="btn btn-primary" id="btn-save-con">Add Rule</button>'
+    + '<button class="btn btn-ghost" id="btn-cancel-con">Cancel</button>'
+    + '</div></div>';
+}
+
+// ─── Reports Tab ───────────────────────────────────────────────────────────
+
+function renderReportsTab() {
+  const total    = S.lessons.length;
+  const placed   = S.schedule.length;
+  const unplaced = total - placed;
+  const pct      = total > 0 ? Math.round((placed/total)*100) : 0;
+
+  // Faculty workload
+  const facLoads = S.faculty.map(f => {
+    const assigned = S.schedule.filter(e => { const l=byId(S.lessons,e.lessonId); return l&&l.teacherId===f.id; }).length;
+    return { f, assigned };
+  }).sort((a,b) => b.assigned - a.assigned);
+
+  // Subject coverage
+  const subjCoverage = S.subjects.map(s => {
+    const required = S.lessons.filter(l => l.subjectId === s.id).reduce((n,l) => n + (l.periodsRequired||1), 0);
+    const placedN  = S.schedule.filter(e => { const l=byId(S.lessons,e.lessonId); return l&&l.subjectId===s.id; }).length;
+    return { s, required, placed: placedN };
+  }).filter(x => x.required > 0);
+
+  // Dept breakdown
+  const deptStats = {};
+  S.faculty.forEach(f => {
+    if (!deptStats[f.department]) deptStats[f.department] = { total:0, fullTime:0, partTime:0, shared:0 };
+    const d = deptStats[f.department];
+    d.total++;
+    if (f.role==='full-time') d.fullTime++;
+    else if (f.role==='part-time') d.partTime++;
+    else if (f.role==='shared') d.shared++;
+  });
+
+  return '<div class="main"><div class="tab-content">'
+    + '<div class="page-header"><h2 class="page-title">Reports</h2>'
+    + '<button class="btn btn-secondary" id="btn-export-csv">⬇ Export CSV</button>'
+    + '</div>'
+    + '<div class="report-cards">'
+    + reportCard(pct + '%', 'Completion', pct < 100 ? '' : 'success')
+    + reportCard(placed, 'Sessions Placed', 'success')
+    + reportCard(unplaced, 'Unscheduled', unplaced > 0 ? 'danger' : 'success')
+    + reportCard(S.faculty.length, 'Faculty')
+    + reportCard(S.sections.length, 'Sections')
+    + '</div>'
+    // Dept breakdown
+    + '<div class="section-title mt-2">Faculty by Department</div>'
+    + '<div class="table-wrap mb-2"><table class="data-table"><thead><tr><th>Dept</th><th>Name</th><th>Total</th><th>Full-time</th><th>Part-time</th><th>Shared</th></tr></thead><tbody>'
+    + Object.entries(deptStats).map(([dept, d]) =>
+        '<tr><td><span class="dept-badge">' + esc(dept) + '</span></td>'
+        + '<td class="text-muted text-sm">' + esc(DEPT_NAMES[dept]||dept) + '</td>'
+        + '<td><strong>' + d.total + '</strong></td>'
+        + '<td style="color:var(--g800)">' + d.fullTime + '</td>'
+        + '<td style="color:var(--warn)">' + d.partTime + '</td>'
+        + '<td style="color:#7B1FA2">' + d.shared + '</td>'
+        + '</tr>').join('')
+    + '</tbody></table></div>'
+    // Faculty workload
+    + '<div class="section-title mt-2">Faculty Workload</div>'
+    + '<div class="table-wrap mb-2"><table class="data-table"><thead><tr><th>Faculty</th><th>Dept</th><th>Type</th><th>Assigned</th><th>Max/Wk</th><th>Load</th></tr></thead><tbody>'
+    + facLoads.map(({ f, assigned }) => {
+        const max  = f.maxPerWeek || 22;
+        const pct2 = max > 0 ? Math.min(Math.round((assigned/max)*100), 100) : 0;
+        const over = assigned > max;
+        return '<tr>'
+          + '<td><strong>' + esc(facName(f)) + '</strong></td>'
+          + '<td><span class="dept-badge">' + esc(f.department) + '</span></td>'
+          + '<td><span class="type-badge type-badge--' + f.role + '">' + esc(f.role) + '</span></td>'
+          + '<td>' + assigned + '</td>'
+          + '<td>' + max + '</td>'
+          + '<td><div class="mini-bar">'
+          + '<div class="mini-bar__track"><div class="mini-bar__fill" style="width:' + pct2 + '%;background:' + (over?'var(--danger)':'var(--g800)') + '"></div></div>'
+          + '<span class="mini-bar__label">' + pct2 + '%</span></div></td></tr>';
+      }).join('')
+    + '</tbody></table></div>'
+    // Subject coverage
+    + '<div class="section-title mt-2">Subject Coverage</div>'
+    + '<div class="table-wrap"><table class="data-table"><thead><tr><th>Subject</th><th>Dept</th><th>Required</th><th>Placed</th><th>Progress</th></tr></thead><tbody>'
+    + subjCoverage.map(({ s, required, placed: p }) => {
+        const pct2 = required > 0 ? Math.min(Math.round((p/required)*100), 100) : 0;
+        return '<tr>'
+          + '<td><span class="subject-dot" style="background:' + s.color + '"></span><strong>' + esc(s.code) + '</strong> — ' + esc(s.name) + '</td>'
+          + '<td><span class="dept-badge">' + esc(s.department) + '</span></td>'
+          + '<td>' + required + '</td>'
+          + '<td>' + p + '</td>'
+          + '<td><div class="mini-bar">'
+          + '<div class="mini-bar__track"><div class="mini-bar__fill" style="width:' + pct2 + '%;background:' + s.color + '"></div></div>'
+          + '<span class="mini-bar__label">' + pct2 + '%</span></div></td></tr>';
+      }).join('')
+    + '</tbody></table></div></div></div>';
+}
+
+function reportCard(val, lbl, modifier) {
+  return '<div class="report-card' + (modifier ? ' report-card--' + modifier : '') + '">'
+    + '<div class="report-card__val">' + val + '</div>'
+    + '<div class="report-card__lbl">' + lbl + '</div></div>';
+}
+
+// ─── Admin Tab ─────────────────────────────────────────────────────────────
+
+function renderAdminTab() {
+  const users = S.adminUsers || [];
+  return '<div class="main"><div class="tab-content">'
+    + '<div class="page-header"><h2 class="page-title">Administration</h2>'
+    + '<button class="btn btn-secondary btn-sm" id="btn-reload-users">↻ Reload Users</button>'
+    + '</div>'
+    + '<div class="admin-grid">'
+    // User management
+    + '<div class="card card-body">'
+    + '<div class="section-title">System Users</div>'
+    + '<p class="text-muted text-sm mb-2">Only <strong>@dlsl.edu.ph</strong> email addresses are accepted.</p>'
+    + '<div class="table-wrap mb-2">'
+    + (users.length === 0
+        ? '<p style="padding:16px;text-align:center;color:var(--text-muted)">No users loaded yet. Click Reload.</p>'
+        : '<table class="data-table"><thead><tr><th>Email</th><th>Name</th><th>Role</th><th>Actions</th></tr></thead><tbody>'
+        + users.map(u => '<tr>'
+            + '<td>' + esc(u.email) + '</td>'
+            + '<td>' + esc(u.name) + '</td>'
+            + '<td><select class="form-select form-select--sm" onchange="handleRoleChange(\''+esc(u.email)+'\',this.value)">'
+            + ['viewer','editor','admin'].map(r=>'<option value="'+r+'"'+(u.role===r?' selected':'')+'>'+r+'</option>').join('')
+            + '</select></td>'
+            + '<td><button class="btn btn-danger btn-xs" data-del-user="' + esc(u.email) + '"'
+            + (u.email.toLowerCase()===S.user.email.toLowerCase()?' disabled title="Cannot remove yourself"':'')
+            + '>Remove</button></td></tr>').join('')
+        + '</tbody></table>')
+    + '</div>'
+    + '<div class="inline-form">'
+    + '<div class="inline-form-title">Add User</div>'
+    + '<div class="form-row mb-1">'
+    + '<div class="form-group" style="flex:2"><label class="form-label">Email (@dlsl.edu.ph)</label><input class="form-input" id="new-user-email" type="email" placeholder="user@dlsl.edu.ph"></div>'
+    + '<div class="form-group"><label class="form-label">Name</label><input class="form-input" id="new-user-name" placeholder="Full name"></div>'
+    + '<div class="form-group"><label class="form-label">Role</label><select class="form-select" id="new-user-role">'
+    + '<option value="viewer">viewer</option><option value="editor">editor</option><option value="admin">admin</option>'
+    + '</select></div>'
+    + '</div>'
+    + '<button class="btn btn-primary" id="btn-add-user">Add User</button>'
+    + '</div></div>'
+    // System settings
+    + '<div class="card card-body">'
+    + '<div class="section-title">System Settings</div>'
+    + '<div class="form-group mb-2"><label class="form-label">School Name</label>'
+    + '<input class="form-input" id="cfg-school" value="' + esc(S.config.schoolName||'') + '"></div>'
+    + '<div class="form-row mb-2">'
+    + '<div class="form-group"><label class="form-label">Academic Year</label><input class="form-input" id="cfg-year" value="' + esc(S.config.academicYear||'') + '"></div>'
+    + '<div class="form-group"><label class="form-label">Term</label><input class="form-input" id="cfg-term" value="' + esc(S.config.term||'') + '"></div>'
+    + '</div>'
+    + '<button class="btn btn-primary" id="btn-save-cfg">Save Settings</button>'
+    + '<div style="margin-top:20px"><div class="section-title">Initialize Sheets</div>'
+    + '<p class="text-muted text-sm mb-1">Run this once after creating the Apps Script project to set up all spreadsheet sheets with proper headers and formatting.</p>'
+    + '<button class="btn btn-secondary" id="btn-init-sheets">⚙ Initialize Sheets</button>'
+    + '</div></div>'
+    + '</div></div></div>';
+}
+
+// ─── Guide Tab ─────────────────────────────────────────────────────────────
+
+function renderGuideTab() {
+  return '<div class="main"><div class="tab-content"><div class="guide-wrap">'
+    + '<div class="page-header"><h2 class="page-title">Administrator Guide</h2></div>'
+    // Setup
+    + guideSection('⚙ Initial Setup', [
+        { n:1, t: 'Initialize sheets', b: 'Go to <strong>Admin → Initialize Sheets</strong>. This creates all required sheets in the Google Spreadsheet with proper headers and Lasallian Green formatting. Run this <strong>only once</strong> after first deployment.' },
+        { n:2, t: 'Add system users', b: 'In <strong>Admin → System Users</strong>, add the email addresses of all timetabler users. <strong>Only @dlsl.edu.ph accounts are accepted.</strong> Assign roles: <em>admin</em> (full access), <em>editor</em> (can add/edit data), <em>viewer</em> (read-only).' },
+        { n:3, t: 'Configure school settings', b: 'In <strong>Admin → System Settings</strong>, set the school name, academic year, and semester/term. Click Save Settings.' },
+      ], 'The first @dlsl.edu.ph Google account to open the app automatically becomes admin. Use that account to add others.')
+    // Buildings & Rooms
+    + guideSection('🏢 Buildings & Rooms', [
+        { n:1, t: 'Add buildings', b: 'Go to <strong>Rooms</strong> tab. Click <strong>+ Room</strong> to open the form, then use the Building Management section at the bottom to add buildings (e.g., "Bro. Edwin Andrew Hall", "Jubilee Hall").' },
+        { n:2, t: 'Add rooms', b: 'Click <strong>+ Room</strong>, fill in the room name, code (e.g., "RH-101"), capacity, room type, and select the building. Room type determines which subjects can be automatically matched to this room.' },
+      ], 'Room types: Classroom, Lab/Computer Lab, Gymnasium, Lecture Hall, Studio, Design Studio, Library, Workshop.')
+    // Faculty
+    + guideSection('👨‍🏫 Faculty Management', [
+        { n:1, t: 'Add faculty', b: 'Go to <strong>Faculty</strong> tab. Click <strong>+ Add</strong>. Fill in name, email (optional), department, track/specialization, employment type, and maximum sessions per day and per week.' },
+        { n:2, t: 'Set availability', b: 'Click a faculty member in the list. The availability grid (Period × Day) shows which slots they can teach. Click each cell to toggle availability. <strong>Green cells = available</strong>. The auto-scheduler will respect these constraints.' },
+        { n:3, t: 'Faculty roles', b: '<strong>Full-time</strong> — regular faculty with full load. <strong>Part-time</strong> — adjunct with limited load. <strong>Shared</strong> — shared with another institution. <strong>Adviser</strong> — primarily an academic adviser.' },
+      ], 'Tip: For part-time faculty available only MWF or TTh, set only those day-columns to available in the grid.')
+    // Subjects & Sections
+    + guideSection('📚 Subjects & Sections', [
+        { n:1, t: 'Add subjects', b: 'Go to <strong>Subjects</strong> tab and click <strong>+ Add Subject</strong>. Enter the subject code (e.g., "CIS101"), full name, department, and optionally the room type required (e.g., "lab" for computer subjects).' },
+        { n:2, t: 'Add sections', b: 'Go to <strong>Sections</strong> tab and click <strong>+ Add Section</strong>. Add each class section (e.g., "BSCS-1A", "BSHM-2B"). Enter year level, class size, and program name.' },
+      ])
+    // Scheduling
+    + guideSection('📅 Scheduling', [
+        { n:1, t: 'Add lessons (class assignments)', b: 'Lessons define which faculty teaches which subject to which section, and how many periods per week are needed. Currently, add lessons directly in the <strong>Lessons</strong> sheet in the Google Spreadsheet. Required columns: SubjectID, TeacherID, SectionID, PeriodsRequired.' },
+        { n:2, t: 'Auto Schedule', b: 'On the <strong>Schedule</strong> tab, click <strong>⚡ Auto Schedule</strong>. The system will attempt to place all unscheduled lessons into available slots, respecting faculty availability, room requirements, and scheduling rules. This may take a few seconds.' },
+        { n:3, t: 'Manual placement', b: 'Click a lesson in the left panel to select it (it turns green). Then click any empty grid cell to place it there. The system will find an available room automatically.' },
+        { n:4, t: 'Lock entries', b: 'Click the 🔒 icon on a placed lesson to lock it. Locked lessons will not be moved by Auto Schedule. Use this to protect manually arranged sessions.' },
+        { n:5, t: 'Clear schedule', b: 'Click <strong>Clear All</strong> (admin only) to remove all non-locked entries and start over.' },
+      ], 'Scheduling rules can be defined in the <strong>Rules</strong> tab — e.g., "spread subject across days", "must not be on Monday", or "requires a lab room".')
+    // Reports
+    + guideSection('📊 Reports', [
+        { n:1, t: 'View reports', b: 'The <strong>Reports</strong> tab shows completion rate, faculty workload (sessions assigned vs. max allowed), department breakdown, and subject coverage progress.' },
+        { n:2, t: 'Export CSV', b: 'Click <strong>⬇ Export CSV</strong> to download the full schedule as a spreadsheet-compatible CSV file.' },
+      ])
+    + '</div></div></div>';
+}
+
+function guideSection(title, steps, tip) {
+  return '<div class="guide-section">'
+    + '<div class="guide-section-title">' + title + '</div>'
+    + steps.map(s => '<div class="guide-step"><div class="guide-step-num">' + s.n + '</div>'
+        + '<div class="guide-step-body"><strong>' + esc(s.t) + '</strong><br>' + s.b + '</div></div>').join('')
+    + (tip ? '<div class="guide-tip"><strong>Tip:</strong> ' + tip + '</div>' : '')
+    + '</div>';
+}
+
+// ─── Event Binding ─────────────────────────────────────────────────────────
+
+function bindEvents() {
+  const app = q('#app');
+
+  // Tab navigation
+  app.addEventListener('click', function(e) {
+    const tabBtn = e.target.closest('[data-tab]');
+    if (tabBtn) { S.tab = tabBtn.dataset.tab; if (S.tab==='admin') loadAdminUsers(); render(); return; }
+
+    // Lesson selection
+    const lessonItem = e.target.closest('[data-lesson-id]');
+    if (lessonItem) {
+      const id = lessonItem.dataset.lessonId;
+      S.selectedLessonId = S.selectedLessonId === id ? null : id;
+      renderSchedulePartial(); return;
+    }
+
+    // Place lesson
+    const cell = e.target.closest('[data-place-period]');
+    if (cell && S.selectedLessonId && canEdit()) {
+      handlePlaceLesson(cell.dataset.placePeriod); return;
+    }
+
+    // Entry card actions
+    const lockBtn = e.target.closest('[data-entry-lock]');
+    if (lockBtn) { handleLockEntry(lockBtn.dataset.entryLock); return; }
+    const removeBtn = e.target.closest('[data-entry-remove]');
+    if (removeBtn && canEdit()) { handleRemoveEntry(removeBtn.dataset.entryRemove); return; }
+
+    // Faculty list
+    const facItem = e.target.closest('[data-fac-id]');
+    if (facItem) { S.selectedFacId = facItem.dataset.facId; S._showAddFacForm = false; render(); return; }
+
+    // Faculty actions
+    if (e.target.id === 'btn-add-fac') { S._showAddFacForm = true; S.selectedFacId = null; render(); return; }
+    if (e.target.id === 'btn-cancel-add-fac') { S._showAddFacForm = false; render(); return; }
+    if (e.target.id === 'btn-submit-add-fac') { handleAddFaculty(); return; }
+    if (e.target.id === 'btn-save-fac') { handleSaveFaculty(e.target.dataset.facId); return; }
+    const delFac = e.target.closest('[data-del-fac]');
+    if (delFac && canEdit()) { handleDeleteFaculty(delFac.dataset.delFac); return; }
+
+    // Availability toggle
+    const availCell = e.target.closest('[data-avail-period]');
+    if (availCell && canEdit()) { handleToggleAvailability(availCell); return; }
+
+    // Room list
+    const roomCard = e.target.closest('[data-room-id]');
+    if (roomCard) { S.selectedRoomId = roomCard.dataset.roomId; S._showAddRoomForm = false; render(); return; }
+    if (e.target.id === 'btn-add-room') { S._showAddRoomForm = true; S.selectedRoomId = null; render(); return; }
+    if (e.target.id === 'btn-cancel-room') { S._showAddRoomForm = false; S.selectedRoomId = null; render(); return; }
+    if (e.target.id === 'btn-save-room') { handleSaveRoom(e.target.dataset.roomId); return; }
+    const delRoom = e.target.closest('[data-del-room]');
+    if (delRoom && canEdit()) { handleDeleteRoom(delRoom.dataset.delRoom); return; }
+    if (e.target.id === 'btn-add-building') { handleAddBuilding(); return; }
+    const delBldg = e.target.closest('[data-del-building]');
+    if (delBldg && canAdmin()) { handleDeleteBuilding(delBldg.dataset.delBuilding); return; }
+
+    // Subjects
+    if (e.target.id === 'btn-toggle-add-subj') { S._showAddSubjForm = !S._showAddSubjForm; render(); return; }
+    if (e.target.id === 'btn-cancel-subj') { S._showAddSubjForm = false; render(); return; }
+    if (e.target.id === 'btn-save-subj') { handleSaveSubject(); return; }
+    const delSubj = e.target.closest('[data-del-subj]');
+    if (delSubj && canEdit()) { handleDeleteSubject(delSubj.dataset.delSubj); return; }
+
+    // Sections
+    if (e.target.id === 'btn-toggle-add-sec') { S._showAddSecForm = !S._showAddSecForm; render(); return; }
+    if (e.target.id === 'btn-cancel-sec') { S._showAddSecForm = false; render(); return; }
+    if (e.target.id === 'btn-save-sec') { handleSaveSection(); return; }
+    const delSec = e.target.closest('[data-del-sec]');
+    if (delSec && canEdit()) { handleDeleteSection(delSec.dataset.delSec); return; }
+
+    // Constraints
+    if (e.target.id === 'btn-toggle-add-con') { S._showAddConForm = !S._showAddConForm; render(); return; }
+    if (e.target.id === 'btn-cancel-con') { S._showAddConForm = false; render(); return; }
+    if (e.target.id === 'btn-save-con') { handleSaveConstraint(); return; }
+    const delCon = e.target.closest('[data-del-con]');
+    if (delCon && canEdit()) { handleDeleteConstraint(delCon.dataset.delCon); return; }
+
+    // Schedule
+    if (e.target.id === 'btn-auto-sched' && canEdit()) { handleAutoSchedule(); return; }
+    if (e.target.id === 'btn-clear-sched' && canAdmin()) { handleClearSchedule(); return; }
+    if (e.target.id === 'clear-filter') { S.filterFacId=''; S.filterSecId=''; S.filterSubjId=''; render(); return; }
+
+    // Reports
+    if (e.target.id === 'btn-export-csv') { handleExportCSV(); return; }
+
+    // Admin
+    if (e.target.id === 'btn-add-user') { handleAddUser(); return; }
+    if (e.target.id === 'btn-reload-users') { loadAdminUsers(); return; }
+    const delUser = e.target.closest('[data-del-user]');
+    if (delUser && canAdmin()) { handleRemoveUser(delUser.dataset.delUser); return; }
+    if (e.target.id === 'btn-save-cfg') { handleSaveConfig(); return; }
+    if (e.target.id === 'btn-init-sheets') { handleInitSheets(); return; }
+  });
+
+  // Live filters
+  app.addEventListener('change', function(e) {
+    if (e.target.id === 'filt-fac')   { S.filterFacId  = e.target.value; renderSchedulePartial(); }
+    if (e.target.id === 'filt-sec')   { S.filterSecId  = e.target.value; renderSchedulePartial(); }
+    if (e.target.id === 'filt-subj')  { S.filterSubjId = e.target.value; renderSchedulePartial(); }
+    if (e.target.id === 'fac-dept-filter') { S.facDeptFilter = e.target.value; render(); }
+  });
+  app.addEventListener('input', function(e) {
+    if (e.target.id === 'fac-search') { S.facSearch = e.target.value; render(); }
+  });
+}
+
+// Partial re-render for schedule tab (avoid full page flash on filter/select)
+function renderSchedulePartial() {
+  const existing = q('.schedule-layout');
+  if (existing) {
+    const tmp = document.createElement('div');
+    tmp.innerHTML = renderScheduleTab();
+    const newLayout = tmp.querySelector('.schedule-layout');
+    if (newLayout) existing.replaceWith(newLayout);
+    const fb = q('.filter-bar');
+    if (fb) fb.replaceWith(tmp.querySelector('.filter-bar'));
+    bindEvents();
+  } else {
+    render();
+  }
+}
+
+// ─── Action Handlers ───────────────────────────────────────────────────────
+
+function handlePlaceLesson(periodId) {
+  if (!S.selectedLessonId || !periodId) return;
+  const lesson = byId(S.lessons, S.selectedLessonId);
+  if (!lesson) return;
+
+  // Find an available room
+  const occupied = entriesForPeriod(periodId).map(e => e.roomId);
+  let roomId = lesson.preferredRoomId;
+  if (!roomId || occupied.includes(roomId)) {
+    const subj = byId(S.subjects, lesson.subjectId);
+    const req = subj ? subj.requiresRoom : null;
+    const room = S.rooms.find(r => !occupied.includes(r.id) && (!req || r.type === req))
+              || S.rooms.find(r => !occupied.includes(r.id));
+    roomId = room ? room.id : '';
+  }
+
+  const entry = { id: 'sch_' + Date.now(), lessonId: lesson.id, periodId, roomId, status: 'placed', lockedBy: '' };
+
+  // Optimistic update
+  S.schedule.push(entry);
+  S.selectedLessonId = null;
+  renderSchedulePartial();
+
+  call('saveScheduleEntry', [entry], function(res) {
+    // Update id from server
+    const idx = S.schedule.indexOf(entry);
+    if (idx > -1) S.schedule[idx].id = res.id;
+    toast('Session placed');
+  }, function() {
+    // Rollback
+    S.schedule = S.schedule.filter(e => e !== entry);
+    render();
+  });
+}
+
+function handleRemoveEntry(entryId) {
+  const entry = S.schedule.find(e => e.id === entryId);
+  if (!entry || entry.status === 'locked') return;
+  S.schedule = S.schedule.filter(e => e.id !== entryId);
+  renderSchedulePartial();
+  call('deleteScheduleEntry', [entryId], () => toast('Session removed'), () => { S.schedule.push(entry); render(); });
+}
+
+function handleLockEntry(entryId) {
+  const entry = S.schedule.find(e => e.id === entryId);
+  if (!entry) return;
+  const wasLocked = entry.status === 'locked';
+  entry.status = wasLocked ? 'placed' : 'locked';
+  renderSchedulePartial();
+  call('saveScheduleEntry', [entry], () => toast(wasLocked ? 'Unlocked' : 'Locked'), () => {
+    entry.status = wasLocked ? 'locked' : 'placed'; render();
+  });
+}
+
+function handleAutoSchedule() {
+  if (!canEdit()) return;
+  toast('Running auto-scheduler…', 'warn');
+  call('autoSchedule', [], function(res) {
+    if (res && res.entries) {
+      S.schedule = res.entries;
+      toast('Scheduled ' + res.placed + ' of ' + res.total + ' lessons');
+      render();
+    }
+  });
+}
+
+function handleClearSchedule() {
+  if (!confirm('Clear all non-locked schedule entries?')) return;
+  call('clearSchedule', [true], function() {
+    S.schedule = S.schedule.filter(e => e.status === 'locked');
+    toast('Schedule cleared (locked entries kept)');
+    render();
+  });
+}
+
+// Faculty
+function handleAddFaculty() {
+  const fn = (q('#nf-fn')||{}).value;
+  const ln = (q('#nf-ln')||{}).value;
+  if (!fn || !ln) { toast('First and last name are required', 'err'); return; }
+  const data = {
+    firstName: fn, lastName: ln, email: (q('#nf-email')||{}).value||'',
+    department: (q('#nf-dept')||{}).value||'GEd', track: (q('#nf-track')||{}).value||'',
+    role: (q('#nf-role')||{}).value||'full-time',
+    maxPerDay: Number((q('#nf-mpd')||{}).value)||5, maxPerWeek: Number((q('#nf-mpw')||{}).value)||22,
+    subjects: [], availability: [], isAdviser: false, notes: '',
+  };
+  call('saveFaculty', [data], function(res) {
+    data.id = res.id;
+    S.faculty.push(data);
+    S.selectedFacId = data.id;
+    S._showAddFacForm = false;
+    toast('Faculty added: ' + fn + ' ' + ln);
+    render();
+  });
+}
+
+function handleSaveFaculty(id) {
+  const fac = byId(S.faculty, id);
+  if (!fac) return;
+  const updated = {
+    ...fac,
+    firstName: (q('#fac-edit-fn')||{}).value || fac.firstName,
+    lastName:  (q('#fac-edit-ln')||{}).value || fac.lastName,
+    email:     (q('#fac-edit-email')||{}).value || fac.email,
+    department:(q('#fac-edit-dept')||{}).value || fac.department,
+    track:     (q('#fac-edit-track')||{}).value || '',
+    role:      (q('#fac-edit-role')||{}).value || fac.role,
+    maxPerDay: Number((q('#fac-edit-mpd')||{}).value) || fac.maxPerDay,
+    maxPerWeek:Number((q('#fac-edit-mpw')||{}).value) || fac.maxPerWeek,
+  };
+  call('saveFaculty', [updated], function() {
+    Object.assign(fac, updated);
+    toast('Faculty updated');
+    render();
+  });
+}
+
+function handleDeleteFaculty(id) {
+  if (!confirm('Delete this faculty member? Their scheduled sessions will remain.')) return;
+  call('deleteFaculty', [id], function() {
+    S.faculty = S.faculty.filter(f => f.id !== id);
+    if (S.selectedFacId === id) S.selectedFacId = null;
+    toast('Faculty deleted');
+    render();
+  });
+}
+
+function handleToggleAvailability(cell) {
+  const facId    = cell.dataset.availFac;
+  const periodId = cell.dataset.availPeriod;
+  const day      = cell.dataset.availDay;
+  const fac      = byId(S.faculty, facId);
+  if (!fac) return;
+
+  let avail = fac.availability ? [...fac.availability] : [];
+  let daySlot = avail.find(a => a.day === day);
+  if (!daySlot) { daySlot = { day, periodIds: [] }; avail.push(daySlot); }
+
+  const idx = daySlot.periodIds.indexOf(periodId);
+  if (idx === -1) daySlot.periodIds.push(periodId);
+  else daySlot.periodIds.splice(idx, 1);
+
+  fac.availability = avail;
+
+  // Toggle cell immediately
+  cell.classList.toggle('on');
+  cell.textContent = cell.classList.contains('on') ? '✓' : '';
+
+  const update = { ...fac, availability: avail };
+  call('saveFaculty', [update], () => {}, () => {
+    // rollback cell
+    cell.classList.toggle('on');
+    cell.textContent = cell.classList.contains('on') ? '✓' : '';
+    toast('Failed to save availability', 'err');
+  });
+}
+
+// Rooms
+function handleSaveRoom(existingId) {
+  const name = (q('#rf-name')||{}).value;
+  if (!name) { toast('Room name is required', 'err'); return; }
+  const data = {
+    id: existingId || '',
+    name, code: (q('#rf-code')||{}).value||'',
+    capacity: Number((q('#rf-cap')||{}).value)||35,
+    type: (q('#rf-type')||{}).value||'classroom',
+    buildingId: (q('#rf-bldg')||{}).value||'',
+    features: [],
+  };
+  call('saveRoom', [data], function(res) {
+    if (!data.id) data.id = res.id;
+    const idx = S.rooms.findIndex(r => r.id === data.id);
+    if (idx > -1) S.rooms[idx] = data; else S.rooms.push(data);
+    S.selectedRoomId = data.id;
+    S._showAddRoomForm = false;
+    toast('Room saved');
+    render();
+  });
+}
+
+function handleDeleteRoom(id) {
+  if (!confirm('Delete this room?')) return;
+  call('deleteRoom', [id], function() {
+    S.rooms = S.rooms.filter(r => r.id !== id);
+    if (S.selectedRoomId === id) S.selectedRoomId = null;
+    toast('Room deleted'); render();
+  });
+}
+
+function handleAddBuilding() {
+  const name = (q('#new-bldg-name')||{}).value;
+  if (!name) { toast('Building name is required', 'err'); return; }
+  const data = { name, address: (q('#new-bldg-addr')||{}).value||'' };
+  call('saveBuilding', [data], function(res) {
+    data.id = res.id;
+    S.buildings.push(data);
+    toast('Building added: ' + name); render();
+  });
+}
+
+function handleDeleteBuilding(id) {
+  if (!confirm('Delete this building?')) return;
+  call('deleteBuilding', [id], function() {
+    S.buildings = S.buildings.filter(b => b.id !== id);
+    toast('Building deleted'); render();
+  });
+}
+
+// Subjects
+function handleSaveSubject() {
+  const code = (q('#sj-code')||{}).value;
+  const name = (q('#sj-name')||{}).value;
+  if (!code || !name) { toast('Code and name are required', 'err'); return; }
+  const data = {
+    code, name, department: (q('#sj-dept')||{}).value||'GEd',
+    requiresRoom: (q('#sj-req-room')||{}).value||'',
+    color: (q('#sj-color')||{}).value||'#2E7D32',
+  };
+  call('saveSubject', [data], function(res) {
+    data.id = res.id;
+    S.subjects.push(data);
+    S._showAddSubjForm = false;
+    toast('Subject added: ' + code); render();
+  });
+}
+
+function handleDeleteSubject(id) {
+  if (!confirm('Delete this subject?')) return;
+  call('deleteSubject', [id], function() {
+    S.subjects = S.subjects.filter(s => s.id !== id);
+    toast('Subject deleted'); render();
+  });
+}
+
+// Sections
+function handleSaveSection() {
+  const name = (q('#sc-name')||{}).value;
+  if (!name) { toast('Section name is required', 'err'); return; }
+  const data = {
+    name, year: Number((q('#sc-year')||{}).value)||1,
+    size: Number((q('#sc-size')||{}).value)||35,
+    program: (q('#sc-prog')||{}).value||'',
+  };
+  call('saveSection', [data], function(res) {
+    data.id = res.id;
+    S.sections.push(data);
+    S._showAddSecForm = false;
+    toast('Section added: ' + name); render();
+  });
+}
+
+function handleDeleteSection(id) {
+  if (!confirm('Delete this section?')) return;
+  call('deleteSection', [id], function() {
+    S.sections = S.sections.filter(s => s.id !== id);
+    toast('Section deleted'); render();
+  });
+}
+
+// Constraints
+function handleSaveConstraint() {
+  const type = (q('#con-type')||{}).value;
+  if (!type) return;
+  const data = {
+    type, severity: (q('#con-sev')||{}).value||'soft',
+    description: (q('#con-desc')||{}).value||'',
+    teacherId: (q('#con-fac')||{}).value||'',
+    sectionId: (q('#con-sec')||{}).value||'',
+    subjectId: (q('#con-subj')||{}).value||'',
+    value: (q('#con-val')||{}).value||'',
+  };
+  call('saveConstraint', [data], function(res) {
+    data.id = res.id;
+    S.constraints.push(data);
+    S._showAddConForm = false;
+    toast('Rule added'); render();
+  });
+}
+
+function handleDeleteConstraint(id) {
+  call('deleteConstraint', [id], function() {
+    S.constraints = S.constraints.filter(c => c.id !== id);
+    toast('Rule deleted'); render();
+  });
+}
+
+// Admin
+function loadAdminUsers() {
+  call('getUsers', [], function(users) {
+    S.adminUsers = users || [];
+    render();
+  });
+}
+
+function handleAddUser() {
+  const email = (q('#new-user-email')||{}).value;
+  if (!email || !email.toLowerCase().endsWith('@dlsl.edu.ph')) {
+    toast('Only @dlsl.edu.ph email addresses are allowed', 'err'); return;
+  }
+  const data = { email, name: (q('#new-user-name')||{}).value||email.split('@')[0], role: (q('#new-user-role')||{}).value||'viewer' };
+  call('saveUser', [data], function() {
+    S.adminUsers.push(data);
+    toast('User added: ' + email); render();
+  });
+}
+
+function handleRoleChange(email, role) {
+  call('saveUser', [{ email, role, name: (S.adminUsers.find(u=>u.email===email)||{}).name||'' }], function() {
+    const u = S.adminUsers.find(u2 => u2.email === email);
+    if (u) u.role = role;
+    toast('Role updated');
+  });
+}
+
+function handleRemoveUser(email) {
+  if (!confirm('Remove user ' + email + '?')) return;
+  call('removeUser', [email], function() {
+    S.adminUsers = S.adminUsers.filter(u => u.email !== email);
+    toast('User removed'); render();
+  });
+}
+
+function handleSaveConfig() {
+  const school = (q('#cfg-school')||{}).value||S.config.schoolName;
+  const year   = (q('#cfg-year')||{}).value||S.config.academicYear;
+  const term   = (q('#cfg-term')||{}).value||S.config.term;
+  call('saveConfig', ['schoolName', school], () => { S.config.schoolName = school; });
+  call('saveConfig', ['academicYear', year],  () => { S.config.academicYear = year; });
+  call('saveConfig', ['term', term],           () => { S.config.term = term; toast('Settings saved'); render(); });
+}
+
+function handleInitSheets() {
+  if (!confirm('Initialize all sheets in the spreadsheet? Safe to run on existing data.')) return;
+  call('initializeSheets', [], function() { toast('Sheets initialized successfully'); });
+}
+
+function handleExportCSV() {
+  call('exportScheduleCSV', [], function(csv) {
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href = url; a.download = 'dlsl-timetable.csv';
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+    toast('CSV downloaded');
+  });
+}
+</script>
