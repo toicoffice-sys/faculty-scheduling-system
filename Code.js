@@ -37,8 +37,11 @@ function include(fn) {
 
 // ─── Spreadsheet Utilities ─────────────────────────────────────────────────
 
+// Cache spreadsheet object within a single execution (avoids 11× openById calls)
+let _ss = null;
 function ss_() {
-  return SpreadsheetApp.openById(SS_ID);
+  if (!_ss) _ss = SpreadsheetApp.openById(SS_ID);
+  return _ss;
 }
 
 function getSheet(name) {
@@ -125,14 +128,18 @@ function requireRole(minRole) {
   return user;
 }
 
-// ─── Boot Data ─────────────────────────────────────────────────────────────
+// ─── Cache ─────────────────────────────────────────────────────────────────
 
-function getBootData() {
-  const user = getCurrentUser();
-  if (!user) return { error: 'not_authorized' };
-  if (user.error === 'domain_restricted') return { error: 'domain_restricted', email: user.email };
-  return {
-    user,
+const CACHE_KEY = 'dlsl_tt_boot_v1';
+const CACHE_TTL = 90; // seconds — balance between freshness and speed
+
+function getSharedData_() {
+  const cache = CacheService.getScriptCache();
+  const hit = cache.get(CACHE_KEY);
+  if (hit) {
+    try { return JSON.parse(hit); } catch(e) {}
+  }
+  const data = {
     faculty:     readFaculty(),
     buildings:   readBuildings(),
     rooms:       readRooms(),
@@ -144,6 +151,22 @@ function getBootData() {
     constraints: readConstraints(),
     config:      readConfig(),
   };
+  try { cache.put(CACHE_KEY, JSON.stringify(data), CACHE_TTL); } catch(e) {}
+  return data;
+}
+
+function invalidateCache_() {
+  try { CacheService.getScriptCache().remove(CACHE_KEY); } catch(e) {}
+}
+
+// ─── Boot Data ─────────────────────────────────────────────────────────────
+
+function getBootData() {
+  const user = getCurrentUser();
+  if (!user) return { error: 'not_authorized' };
+  if (user.error === 'domain_restricted') return { error: 'domain_restricted', email: user.email };
+  const shared = getSharedData_();
+  return { user, ...shared };
 }
 
 // ─── Config ────────────────────────────────────────────────────────────────
@@ -163,9 +186,10 @@ function saveConfig(key, value) {
   const sh = getSheet(SH.CONFIG);
   const vals = sh.getDataRange().getValues();
   for (let i = 1; i < vals.length; i++) {
-    if (vals[i][0] === key) { sh.getRange(i + 1, 2).setValue(value); return { ok: true }; }
+    if (vals[i][0] === key) { sh.getRange(i + 1, 2).setValue(value); invalidateCache_(); return { ok: true }; }
   }
   sh.appendRow([key, value]);
+  invalidateCache_();
   return { ok: true };
 }
 
@@ -199,12 +223,14 @@ function saveFaculty(data) {
     JSON.stringify(data.subjects || []), JSON.stringify(data.availability || []),
     data.isAdviser ? 'TRUE' : 'FALSE', data.notes || '',
   ]);
+  invalidateCache_();
   return { ok: true, id: data.id };
 }
 
 function deleteFaculty(id) {
   requireRole('editor');
   deleteById(SH.FACULTY, id);
+  invalidateCache_();
   return { ok: true };
 }
 
@@ -220,12 +246,14 @@ function saveBuilding(data) {
   requireRole('editor');
   if (!data.id) data.id = newId('bldg');
   upsertRow(SH.BUILDINGS, [data.id, data.name, data.address || '']);
+  invalidateCache_();
   return { ok: true, id: data.id };
 }
 
 function deleteBuilding(id) {
   requireRole('admin');
   deleteById(SH.BUILDINGS, id);
+  invalidateCache_();
   return { ok: true };
 }
 
@@ -247,12 +275,14 @@ function saveRoom(data) {
     data.type || 'classroom', data.buildingId || '',
     JSON.stringify(data.features || []),
   ]);
+  invalidateCache_();
   return { ok: true, id: data.id };
 }
 
 function deleteRoom(id) {
   requireRole('editor');
   deleteById(SH.ROOMS, id);
+  invalidateCache_();
   return { ok: true };
 }
 
@@ -272,12 +302,14 @@ function saveSubject(data) {
     data.id, data.name || '', data.code || '', data.department || '',
     data.requiresRoom || '', data.color || '#2E7D32',
   ]);
+  invalidateCache_();
   return { ok: true, id: data.id };
 }
 
 function deleteSubject(id) {
   requireRole('editor');
   deleteById(SH.SUBJECTS, id);
+  invalidateCache_();
   return { ok: true };
 }
 
@@ -296,12 +328,14 @@ function saveSection(data) {
   upsertRow(SH.SECTIONS, [
     data.id, data.name || '', data.year || 1, data.size || 35, data.program || '',
   ]);
+  invalidateCache_();
   return { ok: true, id: data.id };
 }
 
 function deleteSection(id) {
   requireRole('editor');
   deleteById(SH.SECTIONS, id);
+  invalidateCache_();
   return { ok: true };
 }
 
@@ -412,12 +446,14 @@ function saveScheduleEntry(data) {
     data.id, data.lessonId, data.periodId, data.roomId,
     data.status || 'placed', data.lockedBy || '',
   ]);
+  invalidateCache_();
   return { ok: true, id: data.id };
 }
 
 function deleteScheduleEntry(id) {
   requireRole('editor');
   deleteById(SH.SCHEDULE, id);
+  invalidateCache_();
   return { ok: true };
 }
 
@@ -428,6 +464,7 @@ function clearSchedule(keepLocked) {
   for (let i = vals.length - 1; i >= 1; i--) {
     if (!keepLocked || vals[i][4] !== 'locked') sh.deleteRow(i + 1);
   }
+  invalidateCache_();
   return { ok: true };
 }
 
@@ -449,12 +486,14 @@ function saveConstraint(data) {
     data.id, data.type || '', data.severity || 'soft', data.description || '',
     data.teacherId || '', data.sectionId || '', data.subjectId || '', data.value || '',
   ]);
+  invalidateCache_();
   return { ok: true, id: data.id };
 }
 
 function deleteConstraint(id) {
   requireRole('editor');
   deleteById(SH.CONSTRAINTS, id);
+  invalidateCache_();
   return { ok: true };
 }
 
@@ -636,6 +675,7 @@ function autoSchedule() {
     sh.appendRow([e.id, e.lessonId, e.periodId, e.roomId, e.status, e.lockedBy || '']);
   });
 
+  invalidateCache_();
   return { ok: true, placed: newEntries.filter(e => e.status !== 'locked').length, total: lessons.length, entries: newEntries };
 }
 
